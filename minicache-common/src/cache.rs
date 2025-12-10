@@ -1,19 +1,27 @@
-pub type EbpfKey = u64;
+const MAX_KEY_LEN: usize = 250;
 
-pub const MAX_VALUE_SIZE: usize = 5120;
-
-#[derive(Copy, Clone)]
 #[repr(C)]
-pub struct EbpfValue {
-    // Metadata (From CacheMetaData)
-    pub cas: u64,
+#[derive(Clone, Copy, Debug)]
+pub struct CacheKey {
+    pub data: [u8; MAX_KEY_LEN],
+    pub len: u16,
+}
+
+pub const MAX_VALUE_SIZE: usize = 1024;
+
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+pub struct CacheValue {
     pub flags: u32,
     pub time_to_live: u32,
 
-    // Data Length
-    pub data_len: u32, // Actual length of the data stored in the array
-    pub _padding: u32, // Ensures 8-byte alignment for the data array
+    pub len: u16,
+    pub padding: u16,
 
-    // Fixed-Size Data Buffer
     pub data: [u8; MAX_VALUE_SIZE],
 }
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for CacheValue {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for CacheKey {}

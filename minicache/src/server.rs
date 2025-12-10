@@ -2,15 +2,14 @@ use std::net::UdpSocket;
 
 use anyhow::Context as _;
 use aya::{
-    maps::Array,
+    maps::{Array, HashMap, MapData},
     programs::{Xdp, XdpFlags},
 };
 use clap::Parser;
-#[rustfmt::skip]
 use log::{debug, warn};
-use minicache_common::protocol::{
+use minicache_common::{cache::{CacheKey, CacheValue}, protocol::{
     REQUEST_HEADER_LEN, RequestHeader, UDP_PREAMBLE_LEN, UdpPreamble,
-};
+}};
 
 #[derive(Debug, Parser)]
 pub struct Opt {
@@ -64,12 +63,12 @@ pub async fn run(opt: Opt) -> anyhow::Result<()> {
     let Opt { iface, port } = opt;
 
     // Cache Map
-    // let cache_map_handle = ebpf
-    //     .take_map("CACHE_MAP")
-    //     .context(format!("eBPF map CACHE_MAP not found"))?;
-    // let cache_map: HashMap<MapData, EbpfKey, EbpfValue> = cache_map_handle
-    //     .try_into()
-    //     .context("Failed to convert map handle to HashMap<EbpfKey, EbpfValue>")?;
+    let cache_map_handle = ebpf
+        .take_map("CACHE_MAP")
+        .context("eBPF map CACHE_MAP not found".to_string())?;
+    let _cache_map: HashMap<MapData, CacheKey, CacheValue> = cache_map_handle
+        .try_into()
+        .context("Failed to convert map handle to HashMap")?;
 
     // Configure the port in the eBPF map
     let config_map_handle = ebpf

@@ -6,14 +6,15 @@ use core::mem;
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::{Array, HashMap},
+    maps::{Array, HashMap, PerCpuArray},
     programs::XdpContext,
 };
 use aya_log_ebpf::info;
 use minicache_common::{
-    cache::{EbpfKey, EbpfValue},
+    cache::{CacheKey, CacheValue},
     protocol::{
-        MAGIC_REQUEST, OPCODE_GET, REQUEST_HEADER_LEN, RequestHeader, UDP_PREAMBLE_LEN, UdpPreamble,
+        MAGIC_REQUEST, OPCODE_GET, OPCODE_SET, REQUEST_HEADER_LEN, RequestHeader, UDP_PREAMBLE_LEN,
+        UdpPreamble,
     },
 };
 use network_types::{
@@ -25,7 +26,7 @@ use network_types::{
 static MAX_ENTRIES: u32 = 1024 * 1024;
 
 #[map]
-static CACHE_MAP: HashMap<EbpfKey, EbpfValue> = HashMap::with_max_entries(
+static CACHE_MAP: HashMap<CacheKey, CacheValue> = HashMap::with_max_entries(
     MAX_ENTRIES,
     0, // flags
 );
@@ -35,6 +36,12 @@ static CONFIG_PORT: Array<u32> = Array::with_max_entries(
     1, // single port value
     0, // flags
 );
+
+#[map]
+static KEY_BUF: PerCpuArray<CacheKey> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static VALUE_BUF: PerCpuArray<CacheValue> = PerCpuArray::with_max_entries(1, 0);
 
 #[xdp]
 pub fn minicache(ctx: XdpContext) -> u32 {
@@ -89,12 +96,11 @@ fn try_minicache(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS); // Ignore packets that are too short to contain memcached header
     }
 
-    let udp_header: *const UdpPreamble = ptr_at(&ctx, payload_offset)?;
+    let _udp_header: *const UdpPreamble = ptr_at(&ctx, payload_offset)?;
     let request_offset = payload_offset + UDP_PREAMBLE_LEN;
     let req_hdr: *const RequestHeader = ptr_at(&ctx, request_offset)?;
 
     let is_binary_request = unsafe { (*req_hdr).magic == MAGIC_REQUEST };
-    let is_get_command = unsafe { (*req_hdr).opcode == OPCODE_GET };
 
     info!(
         &ctx,
@@ -121,14 +127,119 @@ fn try_minicache(ctx: XdpContext) -> Result<u32, ()> {
         unsafe { (*req_hdr).cas },
     );
 
-    if is_binary_request && is_get_command {
-        info!(
-            &ctx,
-            "XDP: Detected Binary TCP GET (Opcode: {}) on port {}", OPCODE_GET, dest_port
-        );
+    if !is_binary_request {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    // Perform cache operations
+    let opcode = unsafe { (*req_hdr).opcode };
+
+    if opcode == OPCODE_GET {
+        return handle_get_command(&ctx, request_offset, req_hdr);
+    } else if opcode == OPCODE_SET {
+        return handle_set_command(&ctx, request_offset, req_hdr);
     }
 
     Ok(xdp_action::XDP_PASS)
+}
+
+fn handle_get_command(
+    ctx: &XdpContext,
+    request_offset: usize,
+    req_hdr: *const RequestHeader,
+) -> Result<u32, ()> {
+    let key_length = unsafe { (*req_hdr).key_length() } as usize;
+
+    let key_offset = request_offset + REQUEST_HEADER_LEN;
+
+    let key_buf_ptr = KEY_BUF.get_ptr_mut(0).ok_or(())?;
+    let ebpf_key = unsafe { &mut *key_buf_ptr };
+
+    if key_length == 0 || key_length > ebpf_key.data.len() {
+        info!(&ctx, "GET: Key length {} out of bounds", key_length);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    // copy key from packet to buffer
+    let key_ptr: *const u8 = ptr_at(ctx, key_offset)?;
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(key_ptr, ebpf_key.data.as_mut_ptr(), key_length);
+    }
+    ebpf_key.len = key_length as u16;
+
+    // lookup
+    if let Some(_value) = unsafe { CACHE_MAP.get(ebpf_key) } {
+        info!(&ctx, "GET: Cache hit. Key Len: {}", key_length);
+
+        // Response packet
+        // XDP_TX 
+    } else {
+        info!(&ctx, "GET: Cache miss. Key Len: {}", key_length);
+    }
+
+    Ok(xdp_action::XDP_PASS)
+}
+
+fn handle_set_command(
+    ctx: &XdpContext,
+    request_offset: usize,
+    req_hdr: *const RequestHeader,
+) -> Result<u32, ()> {
+    let key_length = unsafe { (*req_hdr).key_length() } as usize;
+    let extras_length = unsafe { (*req_hdr).extras_length } as usize;
+    let body_length = unsafe { (*req_hdr).body_length() } as usize;
+
+    let value_length = body_length
+        .checked_sub(key_length)
+        .and_then(|x| x.checked_sub(extras_length))
+        .ok_or(())?;
+
+    // Key starts after Header (24) + Extras (8)
+    let key_start_offset = request_offset + REQUEST_HEADER_LEN + extras_length;
+    let value_start_offset = key_start_offset + key_length;
+
+    let key_buf_ptr = KEY_BUF.get_ptr_mut(0).ok_or(())?;
+    let ebpf_key = unsafe { &mut *key_buf_ptr };
+
+    let value_buf_ptr = VALUE_BUF.get_ptr_mut(0).ok_or(())?;
+    let ebpf_value = unsafe { &mut *value_buf_ptr };
+
+    
+    if key_length == 0 || key_length > ebpf_key.data.len() || value_length > ebpf_value.data.len() {
+        info!(&ctx, "SET: Data size out of bounds or zero key");
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    let key_ptr: *const u8 = ptr_at(ctx, key_start_offset)?;
+    unsafe {
+        core::ptr::copy_nonoverlapping(key_ptr, ebpf_key.data.as_mut_ptr(), key_length);
+    }
+    ebpf_key.len = key_length as u16;
+
+    let value_ptr: *const u8 = ptr_at(ctx, value_start_offset)?;
+    unsafe {
+        core::ptr::copy_nonoverlapping(value_ptr, ebpf_value.data.as_mut_ptr(), value_length);
+    }
+    ebpf_value.len = value_length as u16;
+
+    let extras_ptr: *const u32 = ptr_at(ctx, request_offset + REQUEST_HEADER_LEN)?;
+
+    ebpf_value.flags = unsafe { *extras_ptr };
+    ebpf_value.time_to_live = unsafe { *extras_ptr.add(1) };
+
+    // update
+    match CACHE_MAP.insert(ebpf_key, ebpf_value, 0) {
+        Ok(_) => {
+            info!(&ctx, "SET: Cache SET successful. Key Len: {}", key_length);
+            // TODO: XDP_TX logic to write and send the SET_QUIET response
+            return Ok(xdp_action::XDP_DROP);
+        }
+        Err(_) => {
+            info!(&ctx, "SET: Cache SET failed.");
+            return Ok(xdp_action::XDP_PASS);
+        }
+    }
 }
 
 #[inline(always)]
