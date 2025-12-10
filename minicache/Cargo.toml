@@ -20,8 +20,10 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "net",
     "signal",
+    "time"
 ] }
 clap = { workspace = true, features = ["derive"] }
+byteorder = "1.5.0"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
@@ -39,6 +41,14 @@ cargo_metadata = { workspace = true }
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
 minicache-ebpf = { path = "../minicache-ebpf" }
+
+[dev-dependencies]
+memcache = "0.19.0"
+procspawn = { version = "1.0.1", features = ["test-support"] }
+
+[lib]
+name = "minicache"
+path = "src/lib.rs"
 
 [[bin]]
 name = "minicache"
