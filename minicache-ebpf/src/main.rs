@@ -143,44 +143,48 @@ fn try_minicache(ctx: XdpContext) -> Result<u32, ()> {
     Ok(xdp_action::XDP_PASS)
 }
 
+#[inline(always)]
 fn handle_get_command(
     ctx: &XdpContext,
     request_offset: usize,
     req_hdr: *const RequestHeader,
 ) -> Result<u32, ()> {
     let key_length = unsafe { (*req_hdr).key_length() } as usize;
-
     let key_offset = request_offset + REQUEST_HEADER_LEN;
 
-    let key_buf_ptr = KEY_BUF.get_ptr_mut(0).ok_or(())?;
-    let ebpf_key = unsafe { &mut *key_buf_ptr };
+    let mut ebpf_key = CacheKey::default();
 
     if key_length == 0 || key_length > ebpf_key.data.len() {
         info!(&ctx, "GET: Key length {} out of bounds", key_length);
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // copy key from packet to buffer
-    let key_ptr: *const u8 = ptr_at(ctx, key_offset)?;
+    info!(&ctx, "GET: Looking up key: {}", ebpf_key.data[0]);
 
-    unsafe {
-        core::ptr::copy_nonoverlapping(key_ptr, ebpf_key.data.as_mut_ptr(), key_length);
+    let data_ptr = ctx.data() as *const u8;
+    let data_end = ctx.data_end() as *const u8;
+    let key_ptr = unsafe { data_ptr.add(key_offset) };
+
+    if unsafe { key_ptr.add(key_length.min(1).max(ebpf_key.data.len())) } >= data_end {
+        return Ok(xdp_action::XDP_PASS);
     }
+    unsafe { core::ptr::copy_nonoverlapping(key_ptr, ebpf_key.data.as_mut_ptr(), key_length) };
     ebpf_key.len = key_length as u16;
 
-    // lookup
-    if let Some(_value) = unsafe { CACHE_MAP.get(ebpf_key) } {
-        info!(&ctx, "GET: Cache hit. Key Len: {}", key_length);
+    // read first byte
+    info!(&ctx, "GET: Looking up key: {}", ebpf_key.data[0]);
 
-        // Response packet
-        // XDP_TX 
+    if let Some(value) = unsafe { CACHE_MAP.get(ebpf_key) } {
+        info!(&ctx, "GET: Cache hit - value {}", value.data[0])
+        // ...
     } else {
-        info!(&ctx, "GET: Cache miss. Key Len: {}", key_length);
+        info!(&ctx, "GET: Cache miss.");
     }
 
     Ok(xdp_action::XDP_PASS)
 }
 
+#[inline(always)]
 fn handle_set_command(
     ctx: &XdpContext,
     request_offset: usize,
@@ -195,35 +199,43 @@ fn handle_set_command(
         .and_then(|x| x.checked_sub(extras_length))
         .ok_or(())?;
 
-    // Key starts after Header (24) + Extras (8)
-    let key_start_offset = request_offset + REQUEST_HEADER_LEN + extras_length;
-    let value_start_offset = key_start_offset + key_length;
+    // Key starts after Header + Extras
+    let extras_offset = request_offset + REQUEST_HEADER_LEN;
+    let key_offset = extras_offset + extras_length;
+    let value_offset = key_offset + key_length;
 
-    let key_buf_ptr = KEY_BUF.get_ptr_mut(0).ok_or(())?;
-    let ebpf_key = unsafe { &mut *key_buf_ptr };
+    let mut ebpf_key = CacheKey::default();
+    let mut ebpf_value = CacheValue::default();
 
-    let value_buf_ptr = VALUE_BUF.get_ptr_mut(0).ok_or(())?;
-    let ebpf_value = unsafe { &mut *value_buf_ptr };
-
-    
     if key_length == 0 || key_length > ebpf_key.data.len() || value_length > ebpf_value.data.len() {
         info!(&ctx, "SET: Data size out of bounds or zero key");
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let key_ptr: *const u8 = ptr_at(ctx, key_start_offset)?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(key_ptr, ebpf_key.data.as_mut_ptr(), key_length);
+    let data_ptr = ctx.data() as *const u8;
+    let data_end = ctx.data_end() as *const u8;
+    let key_ptr = unsafe { data_ptr.add(key_offset) };
+    let value_ptr = unsafe { data_ptr.add(value_offset) };
+
+    if unsafe { key_ptr.add(key_length.min(1).max(ebpf_key.data.len())) } >= data_end {
+        return Ok(xdp_action::XDP_PASS);
     }
+    unsafe { core::ptr::copy_nonoverlapping(key_ptr, ebpf_key.data.as_mut_ptr(), key_length) };
     ebpf_key.len = key_length as u16;
 
-    let value_ptr: *const u8 = ptr_at(ctx, value_start_offset)?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(value_ptr, ebpf_value.data.as_mut_ptr(), value_length);
+    if unsafe { value_ptr.add(value_length.min(1).max(ebpf_value.data.len())) } >= data_end {
+        return Ok(xdp_action::XDP_PASS);
     }
+    unsafe {
+        core::ptr::copy_nonoverlapping(value_ptr, ebpf_value.data.as_mut_ptr(), value_length)
+    };
     ebpf_value.len = value_length as u16;
 
-    let extras_ptr: *const u32 = ptr_at(ctx, request_offset + REQUEST_HEADER_LEN)?;
+    let extras_ptr = unsafe { data_ptr.add(extras_offset) } as *const u32;
+
+    if unsafe { extras_ptr.add(2) } >= data_end as *const u32 {
+        return Ok(xdp_action::XDP_PASS);
+    }
 
     ebpf_value.flags = unsafe { *extras_ptr };
     ebpf_value.time_to_live = unsafe { *extras_ptr.add(1) };
@@ -231,13 +243,12 @@ fn handle_set_command(
     // update
     match CACHE_MAP.insert(ebpf_key, ebpf_value, 0) {
         Ok(_) => {
-            info!(&ctx, "SET: Cache SET successful. Key Len: {}", key_length);
-            // TODO: XDP_TX logic to write and send the SET_QUIET response
-            return Ok(xdp_action::XDP_DROP);
+            // ...
+            Ok(xdp_action::XDP_PASS)
         }
         Err(_) => {
             info!(&ctx, "SET: Cache SET failed.");
-            return Ok(xdp_action::XDP_PASS);
+            Ok(xdp_action::XDP_PASS)
         }
     }
 }
