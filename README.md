@@ -20,6 +20,25 @@ cargo run --release
 Cargo build scripts are used to automatically build the eBPF correctly and include it in the
 program.
 
+--- WARNING ---
+
+Currently Minicache is not fully functional. To use the test and see what it does, run:
+
+```shell
+RUST_LOG=info cargo run
+```
+
+and in a separate terminal run:
+
+```shell
+cargo run --bin minicache-test
+```
+
+The first command will start the minicache program, and the second command will run a test that sends a GET request to the minicache server. The minicache program will log information about the request and result of looking up the cache.
+However, the ebpf program will not actually respond to the request yet.
+
+There are also tests that do something similar but Aya logs don't seem to show up when running tests, so it's better to run the above commands directly.
+
 ## Cross-compiling on macOS
 
 Cross compilation should work on both Intel and Apple Silicon Macs.

@@ -4,8 +4,9 @@ members = [
     "minicache",
     "minicache-common",
     "minicache-ebpf",
+    "minicache-test",
 ]
-default-members = ["minicache", "minicache-common"]
+default-members = ["minicache", "minicache-common", "minicache-test"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"

@@ -112,7 +112,6 @@ fn try_minicache(mut ctx: XdpContext) -> Result<u32, ()> {
         payload_len
     );
 
-    // Log all the request header fields
     // info!(
     //     &ctx,
     //     "XDP: Memcached Request Header - Magic: {}, Opcode: {}, Key Length: {}, Extras Length: {}, Data Type: {}, VBucket ID: {}, Total Body Length: {}, Opaque: {}, CAS: {}",
@@ -135,21 +134,16 @@ fn try_minicache(mut ctx: XdpContext) -> Result<u32, ()> {
     let opcode = unsafe { (*req_hdr).opcode };
 
     if opcode == OPCODE_GET {
-        return handle_get_command(&mut ctx, request_offset, req_hdr);
+        return handle_get_command(&mut ctx, request_offset);
     } else if opcode == OPCODE_SET {
-        // return handle_set_command(&ctx, request_offset, req_hdr);
+        return handle_set_command(&ctx, request_offset);
     }
 
     Ok(xdp_action::XDP_PASS)
 }
 
 #[inline(always)]
-fn handle_get_command(
-    ctx: &mut XdpContext,
-    request_offset: usize,
-    req_hdr: *const RequestHeader,
-) -> Result<u32, ()> {
-
+fn handle_get_command(ctx: &mut XdpContext, request_offset: usize) -> Result<u32, ()> {
     let key_offset = request_offset + REQUEST_HEADER_LEN;
     let mut ebpf_key = CacheKey::default();
     let key_length = ebpf_key.data.len();
@@ -179,14 +173,10 @@ fn handle_get_command(
 }
 
 #[inline(always)]
-fn handle_set_command(
-    ctx: &XdpContext,
-    request_offset: usize,
-    req_hdr: *const RequestHeader,
-) -> Result<u32, ()> {
+fn handle_set_command(ctx: &XdpContext, request_offset: usize) -> Result<u32, ()> {
     let key_offset = request_offset + REQUEST_HEADER_LEN;
-    let mut ebpf_key = CacheKey::default();
-    let mut ebpf_data = CacheValue::default();
+    let ebpf_key = CacheKey::default();
+    let ebpf_data = CacheValue::default();
     let key_length = ebpf_key.data.len();
     let value_length = ebpf_data.data.len();
 
@@ -222,11 +212,13 @@ fn handle_set_command(
     // update
     match CACHE_MAP.insert(ebpf_key, ebpf_value, 0) {
         Ok(_) => {
-            // ...
-            Ok(xdp_action::XDP_TX)
+            info!(&ctx, "SET: Cache SET successful.");
+            // Send back some acknowledgment ?
+            Ok(xdp_action::XDP_PASS)
         }
         Err(_) => {
             info!(&ctx, "SET: Cache SET failed.");
+            // Send back some error
             Ok(xdp_action::XDP_PASS)
         }
     }
@@ -260,6 +252,18 @@ fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
 
 #[inline(always)]
 fn rewrite_headers(ctx: &mut XdpContext) -> Result<(), ()> {
+    let prev_checksum = compute_ip_checksum(ptr_at_mut::<Ipv4Hdr>(ctx, EthHdr::LEN)?);
+    let true_checksum = unsafe {
+        (*(ptr_at_mut::<Ipv4Hdr>(ctx, EthHdr::LEN)?)).check[0] as u16
+            | ((*(ptr_at_mut::<Ipv4Hdr>(ctx, EthHdr::LEN)?)).check[1] as u16) << 8
+    };
+    info!(
+        &ctx,
+        "Rewriting headers, computed IP checksum: {}, true IP checksum {}",
+        prev_checksum,
+        true_checksum
+    );
+
     // Ethernet
     let ethhdr: *mut EthHdr = ptr_at_mut(ctx, 0)?;
     unsafe {
@@ -272,7 +276,7 @@ fn rewrite_headers(ctx: &mut XdpContext) -> Result<(), ()> {
     unsafe {
         // Swap IP addresses
         core::ptr::swap_nonoverlapping(&mut (*ipv4hdr).src_addr, &mut (*ipv4hdr).dst_addr, 1);
-        
+
         let checksum = compute_ip_checksum(ipv4hdr);
         (*ipv4hdr).check = checksum.to_be_bytes();
     }
@@ -283,8 +287,8 @@ fn rewrite_headers(ctx: &mut XdpContext) -> Result<(), ()> {
     unsafe {
         // Swap UDP ports
         core::ptr::swap_nonoverlapping(&mut (*udphdr).src, &mut (*udphdr).dst, 1);
-        
-        // Zero out the UDP checksum, the kernel stack will recalculate it
+
+        // Should be recalculated by the kernel ? According to BMC
         (*udphdr).check = [0, 0];
     }
 
@@ -307,12 +311,8 @@ fn compute_ip_checksum(ip: *mut Ipv4Hdr) -> u16 {
         csum += u32::from(word);
         next_ip_u16 = unsafe { next_ip_u16.add(1) };
     }
-    
-    // Fold the higher 16 bits into the lower 16 bits
+
     csum = (csum & 0xFFFF) + (csum >> 16);
-    
-    // Fold again in case the first fold resulted in a carry (e.g., FFFF + 0001 = 10000)
-    // csum = (csum & 0xFFFF) + (csum >> 16);
 
     !(csum as u16)
 }

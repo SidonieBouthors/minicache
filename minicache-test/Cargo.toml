@@ -1,0 +1,13 @@
+[package]
+name = "minicache-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+byteorder = "1.5.0"
+memcache = "0.19.0"
+
+[[bin]]
+name = "minicache-test"
+path = "src/main.rs"
