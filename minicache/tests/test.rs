@@ -10,7 +10,7 @@ use minicache_common::protocol::{REQUEST_HEADER_LEN, UDP_PREAMBLE_LEN};
 const TEST_PORT: u32 = 18112;
 const MEMCACHED_IFACE: &str = "lo";
 
-// --- Memcached Binary Constants (Same as before) ---
+// --- Memcached Binary Constants ---
 const MAGIC_REQUEST: u8 = 0x80;
 const OPCODE_GET: u8 = 0x00;
 const KEY: &[u8] = b"foo";
@@ -32,24 +32,24 @@ fn get_test_opt() -> Opt {
 #[tokio::test]
 async fn test_full_udp_cycle() -> anyhow::Result<()> {
     let opt = get_test_opt();
-    // let server_handle = tokio::spawn(async move { run(opt).await });
+    let _server_handle = tokio::spawn(run(opt));
 
-    let _server_handle = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    // let _server_handle = tokio::task::spawn_blocking(move || {
+    //     let rt = tokio::runtime::Builder::new_current_thread()
+    //         .enable_all()
+    //         .build()
+    //         .unwrap();
 
-        rt.block_on(run(opt))
-    });
+    //     rt.block_on(run(opt))
+    // });
 
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
     let target_addr = format!("127.0.0.1:{}", TEST_PORT);
     let sender_socket = UdpSocket::bind("127.0.0.1:0").context("Failed to bind sender socket")?;
     sender_socket
-        .set_write_timeout(Some(Duration::from_secs(1)))
-        .context("Failed to set write timeout")?;
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .context("Failed to set read timeout")?;
 
     let mut packet: Vec<u8> = Vec::with_capacity(TOTAL_PACKET_LEN);
 
@@ -67,8 +67,8 @@ async fn test_full_udp_cycle() -> anyhow::Result<()> {
     packet.push(0x00);
     packet.write_u16::<BigEndian>(0).unwrap(); // VBucket ID
     packet.write_u32::<BigEndian>(KEY_LEN as u32).unwrap(); // Body Length = 3
-    packet.write_u32::<byteorder::NativeEndian>(0).unwrap(); // Opaque
-    packet.write_u64::<byteorder::NativeEndian>(0).unwrap(); // CAS
+    packet.write_u32::<BigEndian>(0).unwrap(); // Opaque
+    packet.write_u64::<BigEndian>(0).unwrap(); // CAS 
 
     // Key Body
     packet.extend_from_slice(KEY);
@@ -87,7 +87,35 @@ async fn test_full_udp_cycle() -> anyhow::Result<()> {
         "Did not send the full packet size"
     );
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut received_buffer = [0u8; 1024];
+    let (bytes_received, src_addr) = sender_socket
+        .recv_from(&mut received_buffer)
+        .context("Failed to receive echoed UDP packet. Is the server running and configured to echo?")?;
 
+    println!(
+        "[Test] Received {} byte echo from {}",
+        bytes_received,
+        src_addr
+    );
+
+    // The source address of the response should be the server's address
+    assert_eq!(
+        src_addr.to_string(), target_addr,
+        "The response came from an unexpected address"
+    );
+
+    // The size of the received packet must match the size of the sent packet
+    assert_eq!(
+        bytes_received, TOTAL_PACKET_LEN,
+        "Received packet size does not match sent packet size"
+    );
+    
+    // Crucial: The received bytes must be identical to the sent bytes (the echo)
+    let received_packet = &received_buffer[..bytes_received];
+    assert_eq!(
+        received_packet, packet,
+        "The received packet is not an exact echo of the sent packet."
+    );
+    
     Ok(())
 }

@@ -51,7 +51,7 @@ pub fn minicache(ctx: XdpContext) -> u32 {
     }
 }
 
-fn try_minicache(ctx: XdpContext) -> Result<u32, ()> {
+fn try_minicache(mut ctx: XdpContext) -> Result<u32, ()> {
     let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
     match unsafe { (*ethhdr).ether_type() } {
         Ok(EtherType::Ipv4) => {}
@@ -113,19 +113,19 @@ fn try_minicache(ctx: XdpContext) -> Result<u32, ()> {
     );
 
     // Log all the request header fields
-    info!(
-        &ctx,
-        "XDP: Memcached Request Header - Magic: {}, Opcode: {}, Key Length: {}, Extras Length: {}, Data Type: {}, VBucket ID: {}, Total Body Length: {}, Opaque: {}, CAS: {}",
-        unsafe { (*req_hdr).magic },
-        unsafe { (*req_hdr).opcode },
-        unsafe { (*req_hdr).key_length() },
-        unsafe { (*req_hdr).extras_length },
-        unsafe { (*req_hdr).data_type },
-        unsafe { (*req_hdr).vbucket_id() },
-        unsafe { (*req_hdr).body_length() },
-        unsafe { (*req_hdr).opaque },
-        unsafe { (*req_hdr).cas },
-    );
+    // info!(
+    //     &ctx,
+    //     "XDP: Memcached Request Header - Magic: {}, Opcode: {}, Key Length: {}, Extras Length: {}, Data Type: {}, VBucket ID: {}, Total Body Length: {}, Opaque: {}, CAS: {}",
+    //     unsafe { (*req_hdr).magic },
+    //     unsafe { (*req_hdr).opcode },
+    //     unsafe { (*req_hdr).key_length() },
+    //     unsafe { (*req_hdr).extras_length },
+    //     unsafe { (*req_hdr).data_type },
+    //     unsafe { (*req_hdr).vbucket_id() },
+    //     unsafe { (*req_hdr).body_length() },
+    //     unsafe { (*req_hdr).opaque },
+    //     unsafe { (*req_hdr).cas },
+    // );
 
     if !is_binary_request {
         return Ok(xdp_action::XDP_PASS);
@@ -135,9 +135,9 @@ fn try_minicache(ctx: XdpContext) -> Result<u32, ()> {
     let opcode = unsafe { (*req_hdr).opcode };
 
     if opcode == OPCODE_GET {
-        return handle_get_command(&ctx, request_offset, req_hdr);
+        return handle_get_command(&mut ctx, request_offset, req_hdr);
     } else if opcode == OPCODE_SET {
-        return handle_set_command(&ctx, request_offset, req_hdr);
+        // return handle_set_command(&ctx, request_offset, req_hdr);
     }
 
     Ok(xdp_action::XDP_PASS)
@@ -145,43 +145,37 @@ fn try_minicache(ctx: XdpContext) -> Result<u32, ()> {
 
 #[inline(always)]
 fn handle_get_command(
-    ctx: &XdpContext,
+    ctx: &mut XdpContext,
     request_offset: usize,
     req_hdr: *const RequestHeader,
 ) -> Result<u32, ()> {
-    let key_length = unsafe { (*req_hdr).key_length() } as usize;
+
     let key_offset = request_offset + REQUEST_HEADER_LEN;
-
     let mut ebpf_key = CacheKey::default();
-
-    if key_length == 0 || key_length > ebpf_key.data.len() {
-        info!(&ctx, "GET: Key length {} out of bounds", key_length);
-        return Ok(xdp_action::XDP_PASS);
-    }
-
-    info!(&ctx, "GET: Looking up key: {}", ebpf_key.data[0]);
+    let key_length = ebpf_key.data.len();
 
     let data_ptr = ctx.data() as *const u8;
     let data_end = ctx.data_end() as *const u8;
     let key_ptr = unsafe { data_ptr.add(key_offset) };
 
-    if unsafe { key_ptr.add(key_length.min(1).max(ebpf_key.data.len())) } >= data_end {
+    if unsafe { key_ptr.add(key_length) } > data_end {
+        info!(&ctx, "GET: Key pointer out of bounds");
         return Ok(xdp_action::XDP_PASS);
     }
     unsafe { core::ptr::copy_nonoverlapping(key_ptr, ebpf_key.data.as_mut_ptr(), key_length) };
-    ebpf_key.len = key_length as u16;
 
     // read first byte
     info!(&ctx, "GET: Looking up key: {}", ebpf_key.data[0]);
 
     if let Some(value) = unsafe { CACHE_MAP.get(ebpf_key) } {
-        info!(&ctx, "GET: Cache hit - value {}", value.data[0])
-        // ...
+        info!(&ctx, "GET: Cache hit - value {}", value.data[0]);
+        rewrite_headers(ctx)?;
+        Ok(xdp_action::XDP_TX)
     } else {
         info!(&ctx, "GET: Cache miss.");
+        rewrite_headers(ctx)?;
+        Ok(xdp_action::XDP_TX)
     }
-
-    Ok(xdp_action::XDP_PASS)
 }
 
 #[inline(always)]
@@ -190,18 +184,13 @@ fn handle_set_command(
     request_offset: usize,
     req_hdr: *const RequestHeader,
 ) -> Result<u32, ()> {
-    let key_length = unsafe { (*req_hdr).key_length() } as usize;
-    let extras_length = unsafe { (*req_hdr).extras_length } as usize;
-    let body_length = unsafe { (*req_hdr).body_length() } as usize;
+    let key_offset = request_offset + REQUEST_HEADER_LEN;
+    let mut ebpf_key = CacheKey::default();
+    let mut ebpf_data = CacheValue::default();
+    let key_length = ebpf_key.data.len();
+    let value_length = ebpf_data.data.len();
 
-    let value_length = body_length
-        .checked_sub(key_length)
-        .and_then(|x| x.checked_sub(extras_length))
-        .ok_or(())?;
-
-    // Key starts after Header + Extras
-    let extras_offset = request_offset + REQUEST_HEADER_LEN;
-    let key_offset = extras_offset + extras_length;
+    let key_offset = key_offset + REQUEST_HEADER_LEN;
     let value_offset = key_offset + key_length;
 
     let mut ebpf_key = CacheKey::default();
@@ -221,7 +210,6 @@ fn handle_set_command(
         return Ok(xdp_action::XDP_PASS);
     }
     unsafe { core::ptr::copy_nonoverlapping(key_ptr, ebpf_key.data.as_mut_ptr(), key_length) };
-    ebpf_key.len = key_length as u16;
 
     if unsafe { value_ptr.add(value_length.min(1).max(ebpf_value.data.len())) } >= data_end {
         return Ok(xdp_action::XDP_PASS);
@@ -231,20 +219,11 @@ fn handle_set_command(
     };
     ebpf_value.len = value_length as u16;
 
-    let extras_ptr = unsafe { data_ptr.add(extras_offset) } as *const u32;
-
-    if unsafe { extras_ptr.add(2) } >= data_end as *const u32 {
-        return Ok(xdp_action::XDP_PASS);
-    }
-
-    ebpf_value.flags = unsafe { *extras_ptr };
-    ebpf_value.time_to_live = unsafe { *extras_ptr.add(1) };
-
     // update
     match CACHE_MAP.insert(ebpf_key, ebpf_value, 0) {
         Ok(_) => {
             // ...
-            Ok(xdp_action::XDP_PASS)
+            Ok(xdp_action::XDP_TX)
         }
         Err(_) => {
             info!(&ctx, "SET: Cache SET failed.");
@@ -264,6 +243,78 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     }
 
     Ok((start + offset) as *const T)
+}
+
+#[inline(always)]
+fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    let len = mem::size_of::<T>();
+
+    if start + offset + len > end {
+        return Err(());
+    }
+
+    Ok((start + offset) as *mut T)
+}
+
+#[inline(always)]
+fn rewrite_headers(ctx: &mut XdpContext) -> Result<(), ()> {
+    // Ethernet
+    let ethhdr: *mut EthHdr = ptr_at_mut(ctx, 0)?;
+    unsafe {
+        // Swap MAC addresses
+        core::ptr::swap_nonoverlapping(&mut (*ethhdr).src_addr, &mut (*ethhdr).dst_addr, 1);
+    }
+
+    // IPv4
+    let ipv4hdr: *mut Ipv4Hdr = ptr_at_mut(ctx, EthHdr::LEN)?;
+    unsafe {
+        // Swap IP addresses
+        core::ptr::swap_nonoverlapping(&mut (*ipv4hdr).src_addr, &mut (*ipv4hdr).dst_addr, 1);
+        
+        let checksum = compute_ip_checksum(ipv4hdr);
+        (*ipv4hdr).check = checksum.to_be_bytes();
+    }
+
+    // UDP Header
+    let transport_header_offset = EthHdr::LEN + Ipv4Hdr::LEN;
+    let udphdr: *mut UdpHdr = ptr_at_mut(ctx, transport_header_offset)?;
+    unsafe {
+        // Swap UDP ports
+        core::ptr::swap_nonoverlapping(&mut (*udphdr).src, &mut (*udphdr).dst, 1);
+        
+        // Zero out the UDP checksum, the kernel stack will recalculate it
+        (*udphdr).check = [0, 0];
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+fn compute_ip_checksum(ip: *mut Ipv4Hdr) -> u16 {
+    let ip_hdr: &mut Ipv4Hdr = unsafe { &mut *ip };
+
+    ip_hdr.check = [0, 0];
+    let mut next_ip_u16: *const u16 = ip as *const u16;
+
+    let mut csum: u32 = 0;
+
+    const IPV4_HEADER_U16_COUNT: usize = mem::size_of::<Ipv4Hdr>() / mem::size_of::<u16>();
+
+    for _ in 0..IPV4_HEADER_U16_COUNT {
+        let word = unsafe { *next_ip_u16 };
+        csum += u32::from(word);
+        next_ip_u16 = unsafe { next_ip_u16.add(1) };
+    }
+    
+    // Fold the higher 16 bits into the lower 16 bits
+    csum = (csum & 0xFFFF) + (csum >> 16);
+    
+    // Fold again in case the first fold resulted in a carry (e.g., FFFF + 0001 = 10000)
+    // csum = (csum & 0xFFFF) + (csum >> 16);
+
+    !(csum as u16)
 }
 
 #[cfg(not(test))]

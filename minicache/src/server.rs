@@ -1,15 +1,14 @@
-use std::net::UdpSocket;
-
 use anyhow::Context as _;
 use aya::{
-    maps::{Array, HashMap, MapData},
+    maps::{Array, HashMap, MapData, PerfEventArray},
     programs::{Xdp, XdpFlags},
 };
 use clap::Parser;
 use log::{debug, warn};
-use minicache_common::{cache::{CacheKey, CacheValue}, protocol::{
-    REQUEST_HEADER_LEN, RequestHeader, UDP_PREAMBLE_LEN, UdpPreamble,
-}};
+use minicache_common::{
+    cache::{CacheKey, CacheValue},
+    protocol::{REQUEST_HEADER_LEN, RequestHeader, UDP_PREAMBLE_LEN, UdpPreamble},
+};
 
 #[derive(Debug, Parser)]
 pub struct Opt {
@@ -87,31 +86,33 @@ pub async fn run(opt: Opt) -> anyhow::Result<()> {
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
     let bind_address = format!("0.0.0.0:{}", port);
-    let socket = UdpSocket::bind(&bind_address)?;
+    let socket = tokio::net::UdpSocket::bind(&bind_address).await?;
     println!("UDP listener started on {}", bind_address);
 
     loop {
         let mut buffer = [0; BUFFER_SIZE];
-
-        match socket.recv_from(&mut buffer) {
-            Ok((number_of_bytes, _src_addr)) => {
-                let data = &buffer[..number_of_bytes];
-
-                // Process it as RequestHeader
-                if number_of_bytes >= UDP_PREAMBLE_LEN + REQUEST_HEADER_LEN {
-                    let _udp_preamble: UdpPreamble =
-                        unsafe { std::ptr::read_unaligned(data.as_ptr() as *const _) };
-                    let _header: RequestHeader = unsafe {
-                        std::ptr::read_unaligned(data[UDP_PREAMBLE_LEN..].as_ptr() as *const _)
-                    };
-                    // println!("Request Header: {:?}", header);
-                } else {
-                    println!("Received data is too small");
-                }
-            }
+        let (number_of_bytes, src_addr) = match socket.recv_from(&mut buffer).await {
+            Ok(result) => result,
             Err(e) => {
                 eprintln!("An error occurred while receiving: {}", e);
+                continue; // Continue loop on error
             }
+        };
+
+        println!("Received {} bytes", number_of_bytes);
+        let data = &buffer[..number_of_bytes];
+
+        // Process it as RequestHeader
+        if number_of_bytes >= UDP_PREAMBLE_LEN + REQUEST_HEADER_LEN {
+            let _udp_preamble: UdpPreamble =
+                unsafe { std::ptr::read_unaligned(data.as_ptr() as *const _) };
+            let _header: RequestHeader =
+                unsafe { std::ptr::read_unaligned(data[UDP_PREAMBLE_LEN..].as_ptr() as *const _) };
+            // println!("Request Header: {:?}", header);
+
+            // socket.send_to(data, src_addr).await?;
+        } else {
+            println!("Received data is too small");
         }
     }
 }

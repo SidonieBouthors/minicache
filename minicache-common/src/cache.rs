@@ -1,17 +1,17 @@
-const MAX_KEY_LEN: usize = 64;
+use core::hash::Hash;
+
+const KEY_LEN: usize = 64;
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct CacheKey {
-    pub data: [u8; MAX_KEY_LEN],
-    pub len: u16,
+    pub data: [u8; KEY_LEN],
 }
 
 impl Default for CacheKey {
     fn default() -> Self {
         Self {
-            data: [0; MAX_KEY_LEN],
-            len: 0,
+            data: [0; KEY_LEN]
         }
     }
 }
