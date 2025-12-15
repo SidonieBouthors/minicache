@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use aya::{
-    maps::{Array, HashMap, MapData, PerfEventArray},
+    maps::{Array, HashMap, MapData},
     programs::{Xdp, XdpFlags},
 };
 use clap::Parser;
