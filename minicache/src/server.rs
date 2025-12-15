@@ -99,6 +99,8 @@ pub async fn run(opt: Opt) -> anyhow::Result<()> {
             }
         };
 
+        // In the final version, this should not be needed:
+        // All get and set requests should be handled in eBPF
         println!("Received {} bytes", number_of_bytes);
         let data = &buffer[..number_of_bytes];
 
